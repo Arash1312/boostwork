@@ -76,6 +76,15 @@ class SmartOrganizer(FileSystemEventHandler):
                 os.path.basename(file_path))
             )
 
+
+## Future Improvements
+
+* AI document classification
+* Cloud synchronization
+* Web dashboard
+* Telegram notifications
+* File analytics and reports
+
 if __name__ == "__main__":
     path = "./Downloads"
 
@@ -96,15 +105,6 @@ if __name__ == "__main__":
 
     observer.join()
 ```
-
-## Future Improvements
-
-* AI document classification
-* Cloud synchronization
-* Web dashboard
-* Telegram notifications
-* File analytics and reports
-
 ## License
 
 MIT License
