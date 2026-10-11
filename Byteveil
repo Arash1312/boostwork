@@ -1,0 +1,378 @@
+
+#!/usr/bin/env python3
+"""
+Byteveil - Lightweight File Security Auditor
+
+Features:
+- SHA-256 file hashing
+- Sensitive filename detection
+- Large file detection
+- JSON report generation
+- Safe, read-only filesystem scanning
+
+Requires Python 3.10+
+Uses only the Python standard library.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import sys
+
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+
+APP_NAME = "Byteveil"
+VERSION = "1.0.0"
+CHUNK_SIZE = 1024 * 1024
+
+DEFAULT_MAX_SIZE_MB = 100
+
+SKIP_DIRECTORIES = {
+    ".git",
+    ".hg",
+    ".svn",
+    "__pycache__",
+    ".venv",
+    "venv",
+    "node_modules",
+}
+
+SENSITIVE_NAMES = {
+    ".env",
+    ".env.local",
+    ".env.production",
+    "id_rsa",
+    "id_ed25519",
+    "credentials",
+    "credentials.json",
+    "secrets.json",
+    "service-account.json",
+    "private.key",
+    "private.pem",
+    "wallet.dat",
+}
+
+SENSITIVE_SUFFIXES = {
+    ".pem",
+    ".p12",
+    ".pfx",
+    ".key",
+}
+
+SENSITIVE_KEYWORDS = {
+    "secret",
+    "credential",
+    "password",
+    "private_key",
+    "private-key",
+    "apikey",
+    "api_key",
+    "access_token",
+}
+
+
+def sha256_file(path: Path) -> str:
+    """Calculate a file's SHA-256 digest incrementally."""
+    digest = hashlib.sha256()
+
+    with path.open("rb") as file:
+        while True:
+            chunk = file.read(CHUNK_SIZE)
+            if not chunk:
+                break
+            digest.update(chunk)
+
+    return digest.hexdigest()
+
+
+def is_sensitive_name(filename: str) -> bool:
+    """Flag potentially sensitive filenames, not file contents."""
+    name = filename.lower()
+
+    if name in SENSITIVE_NAMES:
+        return True
+
+    if name.endswith(tuple(SENSITIVE_SUFFIXES)):
+        return True
+
+    return any(keyword in name for keyword in SENSITIVE_KEYWORDS)
+
+
+def human_size(size_bytes: int) -> str:
+    """Format a byte count for terminal output."""
+    size = float(size_bytes)
+
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
+            return f"{size:.2f} {unit}"
+        size /= 1024
+
+    return f"{size:.2f} TB"
+
+
+def scan_directory(
+    root: Path,
+    max_size_mb: float,
+    calculate_hashes: bool = True,
+) -> dict[str, Any]:
+    """Scan a directory without modifying its contents."""
+    results: list[dict[str, Any]] = []
+    errors: list[dict[str, str]] = []
+
+    files_scanned = 0
+    total_bytes = 0
+    threshold = int(max_size_mb * 1024 * 1024)
+
+    for current_dir, directories, filenames in os.walk(
+        root,
+        followlinks=False,
+        onerror=lambda error: errors.append(
+            {
+                "path": str(error.filename or root),
+                "error": str(error),
+            }
+        ),
+    ):
+        # Skip common dependency and version-control folders.
+        directories[:] = sorted(
+            directory
+            for directory in directories
+            if directory not in SKIP_DIRECTORIES
+        )
+
+        for filename in sorted(filenames):
+            path = Path(current_dir) / filename
+
+            try:
+                if path.is_symlink() or not path.is_file():
+                    continue
+
+                stat = path.stat()
+                relative_path = path.relative_to(root).as_posix()
+
+                record: dict[str, Any] = {
+                    "path": relative_path,
+                    "size_bytes": stat.st_size,
+                    "size_human": human_size(stat.st_size),
+                    "sensitive_name": is_sensitive_name(filename),
+                    "large_file": stat.st_size >= threshold,
+                    "sha256": None,
+                }
+
+                if calculate_hashes:
+                    record["sha256"] = sha256_file(path)
+
+                results.append(record)
+                files_scanned += 1
+                total_bytes += stat.st_size
+
+            except (OSError, PermissionError) as error:
+                errors.append(
+                    {
+                        "path": str(path),
+                        "error": str(error),
+                    }
+                )
+
+    sensitive_files = [
+        item for item in results if item["sensitive_name"]
+    ]
+
+    large_files = [
+        item for item in results if item["large_file"]
+    ]
+
+    return {
+        "tool": APP_NAME,
+        "version": VERSION,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "scan_root": str(root),
+        "hashing_enabled": calculate_hashes,
+        "summary": {
+            "files_scanned": files_scanned,
+            "total_bytes": total_bytes,
+            "total_size": human_size(total_bytes),
+            "sensitive_name_matches": len(sensitive_files),
+            "large_files": len(large_files),
+            "errors": len(errors),
+        },
+        "sensitive_files": sensitive_files,
+        "large_files": large_files,
+        "files": results,
+        "errors": errors,
+        "limitations": [
+            "Sensitive detection checks filenames, not file contents.",
+            "A filename match does not prove that a file is compromised.",
+            "SHA-256 identifies file content but does not establish trust.",
+            "Files may change while a scan is running.",
+        ],
+    }
+
+
+def print_report(report: dict[str, Any]) -> None:
+    """Print a readable summary to the terminal."""
+    summary = report["summary"]
+
+    print(f"\n{APP_NAME} v{VERSION}")
+    print("=" * 48)
+    print(f"Directory:       {report['scan_root']}")
+    print(f"Files scanned:   {summary['files_scanned']}")
+    print(f"Total size:      {summary['total_size']}")
+    print(f"Sensitive names: {summary['sensitive_name_matches']}")
+    print(f"Large files:     {summary['large_files']}")
+    print(f"Scan errors:     {summary['errors']}")
+
+    if report["sensitive_files"]:
+        print("\n[!] Potentially sensitive filenames:")
+
+        for item in report["sensitive_files"]:
+            print(f"  - {item['path']}")
+
+    if report["large_files"]:
+        print("\n[+] Large files:")
+
+        for item in report["large_files"]:
+            print(f"  - {item['path']} ({item['size_human']})")
+
+    if report["errors"]:
+        print("\n[!] Files or directories that could not be read:")
+
+        for item in report["errors"][:10]:
+            print(f"  - {item['path']}: {item['error']}")
+
+        if len(report["errors"]) > 10:
+            print(f"  ... and {len(report['errors']) - 10} more")
+
+    print("\nScan complete. No files were intentionally modified.")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="byteveil",
+        description=(
+            "Audit files for sensitive-looking names, large files, "
+            "and SHA-256 fingerprints."
+        ),
+        epilog=(
+            "Example: python byteveil.py ./project "
+            "--output report.json"
+        ),
+    )
+
+    parser.add_argument(
+        "directory",
+        nargs="?",
+        default=".",
+        help="Directory to scan (default: current directory).",
+    )
+
+    parser.add_argument(
+        "--output",
+        "-o",
+        metavar="FILE",
+        help="Write the JSON report to a file.",
+    )
+
+    parser.add_argument(
+        "--max-size-mb",
+        type=float,
+        default=DEFAULT_MAX_SIZE_MB,
+        help=f"Large-file threshold in MB (default: {DEFAULT_MAX_SIZE_MB}).",
+    )
+
+    parser.add_argument(
+        "--no-hash",
+        action="store_true",
+        help="Skip SHA-256 calculation for a faster scan.",
+    )
+
+    parser.add_argument(
+        "--fail-on-sensitive",
+        action="store_true",
+        help="Exit with status 1 if sensitive-looking names are found.",
+    )
+
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {VERSION}",
+    )
+
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+
+    root = Path(args.directory).expanduser().resolve()
+
+    if not root.exists():
+        print(f"Error: directory does not exist: {root}", file=sys.stderr)
+        return 2
+
+    if not root.is_dir():
+        print(f"Error: path is not a directory: {root}", file=sys.stderr)
+        return 2
+
+    if args.max_size_mb < 0:
+        print("Error: --max-size-mb cannot be negative.", file=sys.stderr)
+        return 2
+
+    output_path: Path | None = None
+
+    if args.output:
+        output_path = Path(args.output).expanduser().resolve()
+
+        # Avoid accidentally overwriting an existing scanned file.
+        try:
+            if output_path.exists() and output_path.is_relative_to(root):
+                print(
+                    "Error: report output must be outside the scanned "
+                    "directory when the file already exists.",
+                    file=sys.stderr,
+                )
+                return 2
+        except OSError:
+            print("Error: cannot validate report output path.", file=sys.stderr)
+            return 2
+
+    report = scan_directory(
+        root=root,
+        max_size_mb=args.max_size_mb,
+        calculate_hashes=not args.no_hash,
+    )
+
+    print_report(report)
+
+    if output_path is not None:
+        try:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(
+                json.dumps(report, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            print(f"\nJSON report saved to: {output_path}")
+        except OSError as error:
+            print(
+                f"Error writing report: {error}",
+                file=sys.stderr,
+            )
+            return 2
+
+    if args.fail_on_sensitive and report["sensitive_files"]:
+        return 1
+
+    if report["errors"]:
+        return 2
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
